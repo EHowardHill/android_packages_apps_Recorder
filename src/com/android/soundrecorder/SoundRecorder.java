@@ -34,6 +34,7 @@ import android.database.Cursor;
 import android.media.MediaRecorder;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.PowerManager;
@@ -639,11 +640,8 @@ public class SoundRecorder extends Activity
         cv.put(MediaStore.Audio.Media.IS_MUSIC, "0");
 
         cv.put(MediaStore.Audio.Media.TITLE, title);
-        cv.put(MediaStore.Audio.Media.DATA, file.getAbsolutePath());
-        cv.put(MediaStore.Audio.Media.DATE_ADDED, (int) (current / 1000));
-        cv.put(MediaStore.Audio.Media.DATE_MODIFIED, (int) (modDate / 1000));
-        cv.put(MediaStore.Audio.Media.DURATION, sampleLengthMillis);
         cv.put(MediaStore.Audio.Media.MIME_TYPE, mRequestedType);
+        cv.put(MediaStore.Audio.Media.DURATION, sampleLengthMillis);
         cv.put(MediaStore.Audio.Media.ARTIST,
                 res.getString(R.string.audio_db_artist_name));
         cv.put(MediaStore.Audio.Media.ALBUM,
@@ -652,14 +650,50 @@ public class SoundRecorder extends Activity
         ContentResolver resolver = getContentResolver();
         Uri base = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
         Log.d(TAG, "ContentURI: " + base);
+
+        // KitKat UI P16 modernization: API 29+ MediaStore forbids mutation of
+        // the _data column, so the donor's "write to my own path, then point
+        // MediaStore at it" flow crashes. Use the modern pending-insert
+        // contract instead: create the record (system picks the path),
+        // stream the recording in, then publish it. Same 4.4 fields where
+        // still legal (title/artist/album/is_music), same playlist skipping
+        // donor behavior (IS_MUSIC=0 keeps it out of the music lists).
+        if (Build.VERSION.SDK_INT >= 29) {
+            cv.put(MediaStore.Audio.Media.DISPLAY_NAME, file.getName());
+            cv.put(MediaStore.Audio.Media.RELATIVE_PATH,
+                    android.os.Environment.DIRECTORY_RECORDINGS);
+            cv.put(MediaStore.Audio.Media.IS_PENDING, 1);
+            Uri result = resolver.insert(base, cv);
+            if (result == null) {
+                showMediaDbErrorDialog();
+                return null;
+            }
+            try (java.io.InputStream in = new java.io.FileInputStream(file);
+                 java.io.OutputStream out = resolver.openOutputStream(result)) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                }
+            } catch (java.io.IOException e) {
+                Log.e(TAG, "failed to copy recording into MediaStore", e);
+                resolver.delete(result, null, null);
+                showMediaDbErrorDialog();
+                return null;
+            }
+            ContentValues published = new ContentValues();
+            published.put(MediaStore.Audio.Media.IS_PENDING, 0);
+            resolver.update(result, published, null, null);
+            return result;
+        }
+
+        // Legacy (<Q) path: donor behavior, _data allowed.
+        cv.put(MediaStore.Audio.Media.DATA, file.getAbsolutePath());
+        cv.put(MediaStore.Audio.Media.DATE_ADDED, (int) (current / 1000));
+        cv.put(MediaStore.Audio.Media.DATE_MODIFIED, (int) (modDate / 1000));
         Uri result = resolver.insert(base, cv);
         if (result == null) {
-            new AlertDialog.Builder(this)
-                .setTitle(R.string.app_name)
-                .setMessage(R.string.error_mediadb_new_record)
-                .setPositiveButton(R.string.button_ok, null)
-                .setCancelable(false)
-                .show();
+            showMediaDbErrorDialog();
             return null;
         }
         if (getPlaylistId(res) == -1) {
@@ -668,10 +702,19 @@ public class SoundRecorder extends Activity
         int audioId = Integer.valueOf(result.getLastPathSegment());
         addToPlaylist(resolver, audioId, getPlaylistId(res));
 
-        // Notify those applications such as Music listening to the 
-        // scanner events that a recorded audio file just created. 
+        // Notify those applications such as Music listening to the
+        // scanner events that a recorded audio file just created.
         sendBroadcast(new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, result));
         return result;
+    }
+
+    private void showMediaDbErrorDialog() {
+        new AlertDialog.Builder(this)
+            .setTitle(R.string.app_name)
+            .setMessage(R.string.error_mediadb_new_record)
+            .setPositiveButton(R.string.button_ok, null)
+            .setCancelable(false)
+            .show();
     }
 
     /**
